@@ -1,6 +1,7 @@
 """连接器同步等场景下写入「资源」文章（product_articles），供公开站使用。
 
 无实质正文（仅链接/占位摘要）一律不入库，见 ``domain.articles.polish_payload_has_substantive_content``。
+LLM 欠费/未配置 Key 时走规则兜底润色，仍可在通过价值分与去重后入库。
 """
 from __future__ import annotations
 
@@ -354,38 +355,59 @@ def _create_one_published_article_from_connector_targets(
 
     from .llm_settings_service import resolve_llm_http_config
     from .llm_service import polish_connector_article
+    from .polish_publish_compat import build_rule_fallback_polish_from_snippet, ensure_publishable_polish
 
     _base, _llm_key, _llm_model = resolve_llm_http_config(db)
-    if not (_llm_key or "").strip():
-        _diag(
-            "error",
-            "skip_llm_no_key",
-            f"「{title_prev}」跳过：库内未配置 LLM API Key（所有数据源共用）。"
-            "请在管理端「AI 资讯与数据」保存 Key。",
+    polished: dict | None = None
+    polish_err = ""
+    if (_llm_key or "").strip():
+        polished, polish_err = polish_connector_article(
+            db,
+            snippet=safe,
+            connector_name=connector_name,
+            admin_source_key=src_tag,
+            segment_label=label,
+            rule_title=rule_title,
+            rule_summary=summary_base,
+            value_score=vs,
+            ref_id=f"c{connector_id}:{ing_fp[:12]}",
+            feed_kind=fk,
         )
-        return 0
+    else:
+        polish_err = "no_llm_key"
 
-    polished, polish_err = polish_connector_article(
-        db,
-        snippet=safe,
-        connector_name=connector_name,
-        admin_source_key=src_tag,
-        segment_label=label,
-        rule_title=rule_title,
-        rule_summary=summary_base,
-        value_score=vs,
-        ref_id=f"c{connector_id}:{ing_fp[:12]}",
-        feed_kind=fk,
+    ready = (
+        ensure_publishable_polish(
+            polished,
+            admin_source_key=admin_source_key,
+            snippet=safe,
+            rule_title=rule_title,
+            rule_summary=summary_base,
+        )
+        if polished
+        else None
     )
-    from .polish_publish_compat import ensure_publishable_polish
+    if not ready:
+        fb = build_rule_fallback_polish_from_snippet(
+            admin_source_key=src_tag,
+            snippet=safe,
+            rule_title=rule_title,
+            rule_summary=summary_base,
+            feed_kind=fk,
+        )
+        if fb:
+            item_ref = (
+                f"pack {connector_rank + 1}/{connector_pool_size}："
+                if connector_pool_size > 1
+                else ""
+            )
+            _diag(
+                "info",
+                "ingest_rule_fallback",
+                f"{item_ref}「{title_prev}」LLM 不可用或未通过校验（{polish_err or 'validate_failed'}），已规则降级入库",
+            )
+            ready = fb
 
-    ready = ensure_publishable_polish(
-        polished,
-        admin_source_key=admin_source_key,
-        snippet=safe,
-        rule_title=rule_title,
-        rule_summary=summary_base,
-    )
     if not ready:
         from .connector_ingest_diagnostics import diagnose_polish_failure
         from .llm_service import _describe_polish_reject

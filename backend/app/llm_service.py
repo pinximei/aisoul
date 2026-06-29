@@ -38,6 +38,17 @@ POLISH_MAX_OUTPUT_TOKENS = 8192
 # 修复重试与首次送模使用同一片段上限（78b3a4b 曾单独压到 3500）
 POLISH_REPAIR_SNIPPET_MAX = CONNECTOR_LLM_SNIPPET_MAX_CHARS
 
+# LLM 账户/配额不可用时不阻断入库，改走规则兜底润色
+_LLM_UNAVAILABLE_HTTP_CODES = frozenset({401, 402, 403, 429, 503})
+
+
+def _llm_http_unavailable_code(exc: BaseException) -> int | None:
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        code = int(exc.response.status_code)
+        if code in _LLM_UNAVAILABLE_HTTP_CODES:
+            return code
+    return None
+
 
 def _log_usage(
     db: Session,
@@ -692,6 +703,9 @@ def polish_connector_article(
                 db, system=system, user=user, ref_id=ref_id, response_json=False, use_tool=True
             )
         except httpx.HTTPStatusError as e_tool:
+            unavailable = _llm_http_unavailable_code(e_tool)
+            if unavailable is not None:
+                return None, f"llm_http_unavailable:{unavailable}", "fail"
             if e_tool.response is None or e_tool.response.status_code not in (400, 404, 422):
                 raise
         if tool_payload:
@@ -703,11 +717,17 @@ def polish_connector_article(
                 db, system=system_json, user=user, ref_id=ref_id, response_json=True, use_tool=False
             )
         except Exception as e1:
+            unavailable = _llm_http_unavailable_code(e1)
+            if unavailable is not None:
+                return None, f"llm_http_unavailable:{unavailable}", "fail"
             try:
                 raw, _ = _polish_llm_call(
                     db, system=system_json, user=user, ref_id=ref_id, response_json=False, use_tool=False
                 )
             except Exception as e2:
+                unavailable2 = _llm_http_unavailable_code(e2)
+                if unavailable2 is not None:
+                    return None, f"llm_http_unavailable:{unavailable2}", "fail"
                 err = f"{type(e2).__name__}: {str(e2)[:240]}"
                 _log_usage(
                     db,
@@ -924,7 +944,7 @@ def polish_connector_article(
             _log_usage(
                 db,
                 "article_ingest_polish",
-                model,
+                _model,
                 0,
                 0,
                 False,
@@ -934,4 +954,13 @@ def polish_connector_article(
             )
         except Exception:
             pass
+        fb = _rule_fallback_polish(
+            admin_source_key=admin_source_key,
+            snippet=snippet_for_compat,
+            rule_title=rule_title,
+            rule_summary=rule_summary,
+            feed_kind=fk,
+        )
+        if fb:
+            return fb, ""
         return None, f"unexpected: {err}"

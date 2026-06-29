@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -62,6 +63,39 @@ def test_polish_connector_article_returns_none_without_api_key() -> None:
         )
     assert out is None
     assert err == "no_llm_key"
+
+
+def test_polish_connector_article_402_uses_rule_fallback() -> None:
+    db = MagicMock()
+    snippet = (
+        '{"title":"Anthropic Eyes IPO","description":"' + ("d" * 120) + '",'
+        '"url":"https://example.com/a"}'
+    )
+    resp = httpx.Response(
+        402,
+        request=httpx.Request("POST", "https://api.deepseek.com/v1/chat/completions"),
+    )
+    err402 = httpx.HTTPStatusError("payment", request=resp.request, response=resp)
+    with patch(
+        "backend.app.llm_service.resolve_llm_http_config",
+        return_value=("https://api.deepseek.com/v1", "sk-test", "deepseek-chat"),
+    ):
+        with patch("backend.app.llm_service._polish_llm_call", side_effect=err402):
+            out, err = polish_connector_article(
+                db,
+                snippet=snippet,
+                connector_name="NewsAPI",
+                admin_source_key="thenewsapi",
+                segment_label="AI",
+                rule_title="同步资源 · AI · NewsAPI",
+                rule_summary="规则摘要" * 12,
+                value_score=50.0,
+                ref_id="ref402",
+                feed_kind="news",
+            )
+    assert out is not None
+    assert err == ""
+    assert "Anthropic" in out["title"]
 
 
 def test_chat_completion_raises_when_no_api_key() -> None:
